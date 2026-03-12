@@ -25,7 +25,8 @@ Bookmark/
 ├── config/
 │   └── settings.py               # All tunable parameters (instruments, risk, strategy)
 ├── pinescripts/
-│   └── breaker_blocks.pine       # TradingView Pine Script v5 – Breaker Blocks indicator
+│   ├── breaker_blocks.pine       # TradingView Pine Script v5 – Breaker Blocks indicator
+│   └── supply_demand.pine        # TradingView Pine Script v5 – Supply & Demand Zones indicator
 ├── src/
 │   ├── indicators.py             # EMA, SMA, RSI, ATR, Bollinger Bands, VWAP
 │   ├── strategy.py               # HFT scalping signal engine
@@ -152,3 +153,55 @@ A Breaker Block is a *failed* Order Block:
 | Extend Boxes to the Right | true | Keep extending until mitigated |
 | Show Labels | true | Display zone labels on the chart |
 | Colors | teal / red | Fully customisable fill and border colours |
+
+---
+
+## Pine Script – Supply & Demand Zones indicator
+
+`pinescripts/supply_demand.pine` is a fully open-source **TradingView Pine Script v5**
+indicator that detects and draws **Supply and Demand zones** using Smart Money Concepts (SMC).
+
+### What are Supply and Demand Zones?
+
+Supply and Demand zones are price areas where institutional order flow previously drove a
+strong impulsive move away from a consolidation (base).  The base represents unfilled limit
+orders that are likely to attract price on revisit.
+
+| Zone Type | Pattern | Description |
+|---|---|---|
+| **Supply (Reversal)** | Rally-Base-Drop (RBD) | Price rallies into a base then drops impulsively — former support becomes resistance |
+| **Demand (Reversal)** | Drop-Base-Rally (DBR) | Price drops into a base then rallies impulsively — former resistance becomes support |
+| **Demand (Continuation)** | Rally-Base-Rally (RBR) | Price rallies, consolidates briefly, then continues higher — base is a continuation support level |
+| **Supply (Continuation)** | Drop-Base-Drop (DBD) | Price drops, consolidates briefly, then continues lower — base is a continuation resistance level |
+
+### Detection logic
+
+1. The **ATR** (default period 14) is used to classify each candle:
+   - **Impulse candle** – body ≥ `Impulse ATR Multiplier` × ATR (default 1.5×)
+   - **Base candle** – body ≤ `Base ATR Multiplier` × ATR (default 0.5×)
+2. A valid zone requires the sequence: **[impulse] → [1 – N base candles] → [impulse]**
+   where N ≤ `Max Base Candles` (default 5).
+3. The **zone** spans the combined high-to-low range of all base candles in the sequence.
+4. The direction of the two impulse candles determines the zone type (RBD, DBR, RBR, DBD).
+5. Zones extend to the right until price **mitigates** the zone (penetrates a configurable
+   % of the zone height from the proximal edge).
+
+### How to add the indicator in TradingView
+
+1. Open TradingView and go to **Pine Editor** (`/` → *Open Pine Editor*).
+2. Paste the contents of `pinescripts/supply_demand.pine`.
+3. Click **Add to chart**.
+4. Adjust the inputs in the *Settings* panel:
+
+| Input | Default | Description |
+|---|---|---|
+| ATR Period | 14 | Period for Average True Range calculation |
+| Impulse ATR Multiplier | 1.5 | Candle body must be ≥ this × ATR to be an impulse candle |
+| Base ATR Multiplier | 0.5 | Candle body must be ≤ this × ATR to be a base (consolidation) candle |
+| Max Base Candles | 5 | Maximum number of consecutive base candles allowed in a valid zone |
+| Mitigation Level (%) | 50 | Zone is invalidated when price penetrates this % of its height from the proximal edge |
+| Show Supply / Demand Zones | true | Toggle supply or demand zones independently |
+| Show Reversal / Continuation Zones | true | Toggle RBD/DBR or RBR/DBD zones independently |
+| Extend Boxes to the Right | true | Keep extending until mitigated |
+| Show Labels | true | Display zone-type labels on the chart |
+| Colors | red / green | Fully customisable fill and border colours |

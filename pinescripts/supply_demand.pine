@@ -1,0 +1,386 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+//
+// © nexobanks-prep / HFT-Bot – open-source, free to use and modify.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+//  SUPPLY & DEMAND ZONES  (Smart Money Concepts)
+//  TradingView Pine Script v5
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//  What are Supply and Demand Zones?
+//  ───────────────────────────────────
+//  Supply and Demand zones are price areas where institutional order flow
+//  previously drove a strong impulsive move away from a consolidation (base).
+//  The base represents unfilled orders that are likely to be re-tested when
+//  price returns to that level.
+//
+//  Zone Types (four canonical patterns)
+//  ──────────────────────────────────────
+//  • Rally-Base-Drop  (RBD) → SUPPLY zone
+//      Price rallies into a consolidation base, then drops impulsively.
+//      The base becomes resistance on revisit.
+//
+//  • Drop-Base-Rally  (DBR) → DEMAND zone
+//      Price drops into a consolidation base, then rallies impulsively.
+//      The base becomes support on revisit.
+//
+//  • Rally-Base-Rally (RBR) → DEMAND (continuation) zone
+//      Price rallies, consolidates briefly, then continues higher.
+//      The base acts as a continuation support level.
+//
+//  • Drop-Base-Drop   (DBD) → SUPPLY (continuation) zone
+//      Price drops, consolidates briefly, then continues lower.
+//      The base acts as a continuation resistance level.
+//
+//  Detection logic (this script)
+//  ──────────────────────────────
+//  1.  A candle is classified as an *impulse* when its body size exceeds
+//      a configurable multiple of the ATR (default: 1.5×).
+//  2.  A candle is classified as a *base* candle when its body is smaller
+//      than a configurable fraction of the ATR (default: 0.5×).  Up to
+//      `maxBaseCandles` (default 5) consecutive base candles are accepted.
+//  3.  The script looks for an impulse → (base candles) → impulse pattern.
+//      The direction of the first impulse and the second impulse determines
+//      whether the zone is a reversal (RBD / DBR) or continuation (RBR / DBD).
+//  4.  The zone spans the high-to-low of all base candles combined.
+//  5.  Zones extend to the right until price *mitigates* them (penetrates
+//      a configurable % of the zone height from the proximal edge).
+//  6.  Once mitigated a zone is hidden; a configurable number of previous
+//      mitigated zones can be kept visible.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
+//@version=5
+indicator(
+     title            = "Supply & Demand Zones [HFT-Bot]",
+     shorttitle       = "S&D Zones",
+     overlay          = true,
+     max_boxes_count  = 500,
+     max_lines_count  = 200,
+     max_labels_count = 200
+ )
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var string GRP_DETECTION = "Detection"
+
+atrPeriod = input.int(
+     defval  = 14,
+     title   = "ATR Period",
+     minval  = 1,
+     maxval  = 50,
+     group   = GRP_DETECTION,
+     tooltip = "Period used to compute the Average True Range for impulse and base classification."
+ )
+
+impulseAtrMult = input.float(
+     defval  = 1.5,
+     title   = "Impulse ATR Multiplier",
+     minval  = 0.5,
+     step    = 0.1,
+     group   = GRP_DETECTION,
+     tooltip = "A candle whose body is ≥ this multiple of ATR is considered an impulse candle."
+ )
+
+baseAtrMult = input.float(
+     defval  = 0.5,
+     title   = "Base ATR Multiplier",
+     minval  = 0.1,
+     step    = 0.1,
+     group   = GRP_DETECTION,
+     tooltip = "A candle whose body is ≤ this multiple of ATR is considered a base (consolidation) candle."
+ )
+
+maxBaseCandles = input.int(
+     defval  = 5,
+     title   = "Max Base Candles",
+     minval  = 1,
+     maxval  = 20,
+     group   = GRP_DETECTION,
+     tooltip = "Maximum number of consecutive base candles allowed inside a valid zone."
+ )
+
+mitigationPct = input.float(
+     defval  = 50.0,
+     title   = "Mitigation Level (%)",
+     minval  = 0.0,
+     maxval  = 100.0,
+     step    = 5.0,
+     group   = GRP_DETECTION,
+     tooltip = "A zone is considered mitigated when price penetrates this % of the zone height from the proximal edge."
+ )
+
+var string GRP_DISPLAY = "Display"
+
+showSupply = input.bool(
+     defval = true,
+     title  = "Show Supply Zones",
+     group  = GRP_DISPLAY
+ )
+
+showDemand = input.bool(
+     defval = true,
+     title  = "Show Demand Zones",
+     group  = GRP_DISPLAY
+ )
+
+showReversal = input.bool(
+     defval = true,
+     title  = "Show Reversal Zones (RBD / DBR)",
+     group  = GRP_DISPLAY,
+     tooltip = "Show Rally-Base-Drop (supply) and Drop-Base-Rally (demand) reversal zones."
+ )
+
+showContinuation = input.bool(
+     defval = true,
+     title  = "Show Continuation Zones (RBR / DBD)",
+     group  = GRP_DISPLAY,
+     tooltip = "Show Rally-Base-Rally (demand continuation) and Drop-Base-Drop (supply continuation) zones."
+ )
+
+extendBoxes = input.bool(
+     defval  = true,
+     title   = "Extend Boxes to the Right",
+     group   = GRP_DISPLAY,
+     tooltip = "Keep extending the zone box until it is mitigated."
+ )
+
+showLabels = input.bool(
+     defval = true,
+     title  = "Show Labels",
+     group  = GRP_DISPLAY
+ )
+
+supplyColor       = input.color(defval = color.new(color.red,    70), title = "Supply Zone Color",            group = GRP_DISPLAY)
+demandColor       = input.color(defval = color.new(color.green,  70), title = "Demand Zone Color",            group = GRP_DISPLAY)
+supplyBorderColor = input.color(defval = color.red,                   title = "Supply Border Color",           group = GRP_DISPLAY)
+demandBorderColor = input.color(defval = color.green,                 title = "Demand Border Color",           group = GRP_DISPLAY)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTERNAL STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Each active zone is tracked via parallel arrays so we can update (extend /
+// close) the box drawings on every bar without custom object types.
+//
+//   _zTop      – top price of the zone
+//   _zBot      – bottom price of the zone
+//   _zLeft     – bar_index of the left edge
+//   _zIsSupply – true = supply zone, false = demand zone
+//   _zBox      – box drawing object
+//   _zLabel    – label drawing object (na when labels are off)
+//   _zDone     – true once mitigated
+
+var float[]  _zTop      = array.new_float()
+var float[]  _zBot      = array.new_float()
+var int[]    _zLeft     = array.new_int()
+var bool[]   _zIsSupply = array.new_bool()
+var box[]    _zBox      = array.new_box()
+var label[]  _zLabel    = array.new_label()
+var bool[]   _zDone     = array.new_bool()
+
+// Rolling state for zone pattern detection.
+// We walk through the following state machine on each bar:
+//   IDLE  → after an impulse candle, move to COLLECTING_BASE
+//   COLLECTING_BASE → accumulate base candles; if count > maxBaseCandles → IDLE
+//   After COLLECTING_BASE, on the next impulse candle → emit zone & → IDLE
+
+var int    _state         = 0      // 0 = IDLE, 1 = COLLECTING_BASE
+var bool   _firstImpulseBull = false  // direction of the leading impulse
+var float  _baseHigh      = na     // running high of base candles
+var float  _baseLow       = na     // running low  of base candles
+var int    _baseStartBar  = na     // bar_index of the first base candle
+var int    _baseCandleCount = 0    // number of base candles collected so far
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ATR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+atrValue = ta.atr(atrPeriod)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Returns true when the *previous* completed bar was a bullish impulse candle.
+isPrevImpulseBull() =>
+    bodySize = math.abs(close[1] - open[1])
+    not na(atrValue) and bodySize >= impulseAtrMult * atrValue and close[1] > open[1]
+
+// Returns true when the *previous* completed bar was a bearish impulse candle.
+isPrevImpulseBear() =>
+    bodySize = math.abs(close[1] - open[1])
+    not na(atrValue) and bodySize >= impulseAtrMult * atrValue and close[1] < open[1]
+
+// Returns true when the *previous* completed bar was a base candle.
+isPrevBase() =>
+    bodySize = math.abs(close[1] - open[1])
+    not na(atrValue) and bodySize <= baseAtrMult * atrValue
+
+// Add a new Supply or Demand zone.
+addZone(float topPrice, float botPrice, int leftBar, bool isSupply, bool isReversal) =>
+    bgCol  = isSupply ? supplyColor       : demandColor
+    bdCol  = isSupply ? supplyBorderColor : demandBorderColor
+    lbl    = isSupply
+         ? (isReversal ? "Supply (RBD)" : "Supply (DBD)")
+         : (isReversal ? "Demand (DBR)" : "Demand (RBR)")
+    txtCol = isSupply ? supplyBorderColor : demandBorderColor
+
+    newBox = box.new(
+         left         = leftBar,
+         right        = bar_index,
+         top          = topPrice,
+         bottom       = botPrice,
+         bgcolor      = bgCol,
+         border_color = bdCol,
+         border_width = 1
+     )
+
+    newLabel = showLabels ? label.new(
+         x         = leftBar,
+         y         = isSupply ? topPrice : botPrice,
+         text      = lbl,
+         color     = color.new(color.black, 100),
+         style     = isSupply ? label.style_label_down : label.style_label_up,
+         textcolor = txtCol,
+         size      = size.small
+     ) : na
+
+    array.push(_zTop,      topPrice)
+    array.push(_zBot,      botPrice)
+    array.push(_zLeft,     leftBar)
+    array.push(_zIsSupply, isSupply)
+    array.push(_zBox,      newBox)
+    array.push(_zLabel,    newLabel)
+    array.push(_zDone,     false)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ZONE PATTERN DETECTION  (state machine, evaluated on each bar)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+//  We evaluate the *previous* bar on each tick so that confirmed OHLC data is
+//  available.  The pattern requires:
+//
+//    [impulse] → [1..maxBaseCandles base candles] → [impulse]
+//
+//  The zone covers the combined high/low range of all base candles.
+
+if barstate.isconfirmed
+
+    // ── IDLE: waiting for an impulse to start a potential zone ──────────────
+    if _state == 0
+        if isPrevImpulseBull()
+            _state              := 1
+            _firstImpulseBull   := true
+            _baseHigh           := na
+            _baseLow            := na
+            _baseStartBar       := na
+            _baseCandleCount    := 0
+        else if isPrevImpulseBear()
+            _state              := 1
+            _firstImpulseBull   := false
+            _baseHigh           := na
+            _baseLow            := na
+            _baseStartBar       := na
+            _baseCandleCount    := 0
+
+    // ── COLLECTING_BASE: accumulate base candles ─────────────────────────────
+    else if _state == 1
+        if isPrevBase()
+            // Extend the base zone with this candle
+            _baseHigh  := na(_baseHigh) ? high[1] : math.max(_baseHigh, high[1])
+            _baseLow   := na(_baseLow)  ? low[1]  : math.min(_baseLow,  low[1])
+            if na(_baseStartBar)
+                _baseStartBar := bar_index - 1
+            _baseCandleCount := _baseCandleCount + 1
+
+            // Too many base candles → not a valid zone
+            if _baseCandleCount > maxBaseCandles
+                _state := 0
+
+        else if isPrevImpulseBull() or isPrevImpulseBear()
+            // Second impulse found – check if we collected at least one base candle
+            if _baseCandleCount >= 1
+                secondImpulseBull = isPrevImpulseBull()
+                isReversal        = _firstImpulseBull != secondImpulseBull
+
+                // Determine zone type
+                // RBD: first bull, second bear → Supply reversal
+                // DBR: first bear, second bull → Demand reversal
+                // RBR: both bull               → Demand continuation
+                // DBD: both bear               → Supply continuation
+                isSupplyZone = _firstImpulseBull and not secondImpulseBull  // RBD
+                           or (not _firstImpulseBull and not secondImpulseBull) // DBD
+
+                // Display filters
+                showThisZone = (isReversal and showReversal) or (not isReversal and showContinuation)
+                showThisZone := showThisZone and ((isSupplyZone and showSupply) or (not isSupplyZone and showDemand))
+
+                if showThisZone and not na(_baseHigh) and not na(_baseLow)
+                    addZone(_baseHigh, _baseLow, _baseStartBar, isSupplyZone, isReversal)
+
+            // The new impulse becomes the leading impulse for the next pattern
+            _firstImpulseBull   := isPrevImpulseBull()
+            _baseHigh           := na
+            _baseLow            := na
+            _baseStartBar       := na
+            _baseCandleCount    := 0
+            // Remain in state 1 to allow chaining (new impulse may start a new base)
+
+        else
+            // Non-impulse, non-base candle → reset state machine
+            _state := 0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXTEND ACTIVE ZONES & CHECK MITIGATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if array.size(_zTop) > 0
+    for i = array.size(_zTop) - 1 to 0
+        if not array.get(_zDone, i)
+            zTop      = array.get(_zTop,      i)
+            zBot      = array.get(_zBot,      i)
+            isSupply  = array.get(_zIsSupply, i)
+            zBoxObj   = array.get(_zBox,      i)
+
+            // Proximal edge is the edge closest to current price:
+            //   Supply zone → proximal edge is the bottom (price is below the zone)
+            //   Demand zone → proximal edge is the top    (price is above the zone)
+            zoneHeight   = zTop - zBot
+            mitigLevel   = isSupply
+                 ? zBot + zoneHeight * (mitigationPct / 100.0)   // supply: measured up from bottom (proximal)
+                 : zTop - zoneHeight * (mitigationPct / 100.0)   // demand: measured down from top (proximal)
+
+            mitigated = isSupply
+                 ? high > mitigLevel   // price rises through supply zone past mitigLevel
+                 : low  < mitigLevel   // price falls through demand zone past mitigLevel
+
+            if mitigated
+                box.set_right(zBoxObj, bar_index)
+                array.set(_zDone, i, true)
+            else if extendBoxes
+                box.set_right(zBoxObj, bar_index + 1)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VISUAL AIDS – ATR band around current close (optional orientation guide)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Faint impulse-threshold lines so traders can visualise the ATR multiples
+// used for classification.  Hidden in the default settings (plot style = none).
+
+plot(
+     close + impulseAtrMult * atrValue,
+     title  = "Impulse Upper Threshold",
+     color  = color.new(color.gray, 90),
+     display = display.none
+ )
+
+plot(
+     close - impulseAtrMult * atrValue,
+     title  = "Impulse Lower Threshold",
+     color  = color.new(color.gray, 90),
+     display = display.none
+ )
