@@ -1,0 +1,494 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+//
+// © nexobanks-prep / HFT-Bot – open-source, free to use and modify.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+//  SUPPLY & DEMAND ZONES + BREAKER BLOCKS  (Smart Money Concepts)
+//  TradingView Pine Script v6  ·  Combined Indicator
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//  This single indicator combines:
+//
+//   1.  Supply & Demand Zones
+//       ──────────────────────
+//       Identifies price areas where large institutional order flow previously
+//       drove a strong impulsive move away from a consolidation (base) region.
+//       Four canonical SMC patterns are detected:
+//
+//         • Rally-Base-Drop  (RBD) → Supply zone (reversal)
+//         • Drop-Base-Rally  (DBR) → Demand zone (reversal)
+//         • Rally-Base-Rally (RBR) → Demand zone (continuation)
+//         • Drop-Base-Drop   (DBD) → Supply zone (continuation)
+//
+//   2.  Breaker Blocks
+//       ──────────────
+//       A Breaker Block is a *failed* Order Block – an OB that price has
+//       already broken through, flipping its polarity:
+//
+//         • Bullish BOS (close > swing high) → last bearish candle before BOS
+//           = bearish OB → when price later closes below the OB bottom, the
+//           zone becomes a BEARISH Breaker Block (former support → resistance).
+//
+//         • Bearish BOS (close < swing low) → last bullish candle before BOS
+//           = bullish OB → when price later closes above the OB top, the zone
+//           becomes a BULLISH Breaker Block (former resistance → support).
+//
+// ─────────────────────────────────────────────────────────────────────────────
+//  v6 architecture highlights
+//  ────────────────────────────
+//  • `SDZone` UDT  – one Supply/Demand zone object replacing parallel arrays.
+//  • `OrderBlock` UDT  – pending OB waiting to be broken.
+//  • `BreakerBlock` UDT  – active Breaker Block drawn on the chart.
+//  • `DetectorState` UDT  – rolling [impulse → base → impulse] state machine.
+//  • All zone-level operations (mitigate, extend, close) implemented as
+//    `method` declarations on the corresponding UDT.
+//  • `switch` expressions used throughout for readable branching.
+// ─────────────────────────────────────────────────────────────────────────────
+
+//@version=6
+indicator(
+     title            = "Supply & Demand + Breaker Blocks v6 [HFT-Bot]",
+     shorttitle       = "SMC Suite v6",
+     overlay          = true,
+     max_boxes_count  = 500,
+     max_lines_count  = 200,
+     max_labels_count = 200
+ )
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Supply & Demand ──────────────────────────────────────────────────────────
+var string GRP_SD = "Supply & Demand"
+
+atrPeriod = input.int(
+     defval  = 14,
+     title   = "ATR Period",
+     minval  = 1,
+     maxval  = 50,
+     group   = GRP_SD,
+     tooltip = "ATR period used to classify impulse and base candles."
+ )
+impulseAtrMult = input.float(
+     defval  = 1.5,
+     title   = "Impulse ATR Multiplier",
+     minval  = 0.5,
+     step    = 0.1,
+     group   = GRP_SD,
+     tooltip = "Candle body ≥ this × ATR → impulse."
+ )
+baseAtrMult = input.float(
+     defval  = 0.5,
+     title   = "Base ATR Multiplier",
+     minval  = 0.1,
+     step    = 0.1,
+     group   = GRP_SD,
+     tooltip = "Candle body ≤ this × ATR → base (consolidation)."
+ )
+maxBaseCandles = input.int(
+     defval  = 5,
+     title   = "Max Base Candles",
+     minval  = 1,
+     maxval  = 20,
+     group   = GRP_SD,
+     tooltip = "Maximum consecutive base candles inside a valid zone."
+ )
+sdMitigationPct = input.float(
+     defval  = 50.0,
+     title   = "S&D Mitigation Level (%)",
+     minval  = 0.0,
+     maxval  = 100.0,
+     step    = 5.0,
+     group   = GRP_SD,
+     tooltip = "S&D zone invalidated when price penetrates this % of zone height from the proximal edge."
+ )
+
+showSupply       = input.bool(defval = true,  title = "Show Supply Zones",              group = GRP_SD)
+showDemand       = input.bool(defval = true,  title = "Show Demand Zones",              group = GRP_SD)
+showReversal     = input.bool(defval = true,  title = "Show Reversal Zones (RBD/DBR)",  group = GRP_SD)
+showContinuation = input.bool(defval = true,  title = "Show Continuation Zones (RBR/DBD)", group = GRP_SD)
+sdExtend         = input.bool(defval = true,  title = "Extend S&D Boxes",               group = GRP_SD)
+sdShowLabels     = input.bool(defval = true,  title = "Show S&D Labels",                group = GRP_SD)
+
+supplyColor  = input.color(defval = color.new(color.red,   70), title = "Supply Fill",   group = GRP_SD)
+demandColor  = input.color(defval = color.new(color.green, 70), title = "Demand Fill",   group = GRP_SD)
+supplyBorder = input.color(defval = color.red,                  title = "Supply Border", group = GRP_SD)
+demandBorder = input.color(defval = color.green,                title = "Demand Border", group = GRP_SD)
+
+// ── Breaker Blocks ───────────────────────────────────────────────────────────
+var string GRP_BB = "Breaker Blocks"
+
+pivotLen = input.int(
+     defval  = 10,
+     title   = "Pivot Length",
+     minval  = 2,
+     maxval  = 50,
+     group   = GRP_BB,
+     tooltip = "Bars on each side used to confirm a swing high/low."
+ )
+lookbackBars = input.int(
+     defval  = 5,
+     title   = "OB Look-back (bars)",
+     minval  = 1,
+     maxval  = 20,
+     group   = GRP_BB,
+     tooltip = "Bars to search back for the last opposing candle (Order Block)."
+ )
+bbMitigationPct = input.float(
+     defval  = 50.0,
+     title   = "BB Mitigation Level (%)",
+     minval  = 0.0,
+     maxval  = 100.0,
+     step    = 5.0,
+     group   = GRP_BB,
+     tooltip = "Breaker Block invalidated when price penetrates this % of zone height."
+ )
+
+showBullBB    = input.bool(defval = true,  title = "Show Bullish Breaker Blocks", group = GRP_BB)
+showBearBB    = input.bool(defval = true,  title = "Show Bearish Breaker Blocks", group = GRP_BB)
+bbExtend      = input.bool(defval = true,  title = "Extend BB Boxes",             group = GRP_BB)
+bbShowLabels  = input.bool(defval = true,  title = "Show BB Labels",              group = GRP_BB)
+showPivots    = input.bool(defval = true,  title = "Show Pivot Markers",          group = GRP_BB)
+
+bullColor  = input.color(defval = color.new(color.teal, 70), title = "Bullish BB Fill",   group = GRP_BB)
+bearColor  = input.color(defval = color.new(color.red,  70), title = "Bearish BB Fill",   group = GRP_BB)
+bullBorder = input.color(defval = color.teal,                title = "Bullish BB Border", group = GRP_BB)
+bearBorder = input.color(defval = color.red,                 title = "Bearish BB Border", group = GRP_BB)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  USER-DEFINED TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Supply / Demand zone ─────────────────────────────────────────────────────
+type SDZone
+    float top
+    float bot
+    int   leftBar
+    bool  isSupply
+    bool  isReversal
+    box   zoneBox
+    label zoneLabel
+    bool  isDone
+
+// ── State machine for [impulse → base(s) → impulse] detection ────────────────
+type DetectorState
+    int   phase            // 0 = IDLE, 1 = COLLECTING_BASE
+    bool  firstIsBull
+    float baseHigh
+    float baseLow
+    int   baseStartBar
+    int   baseCandleCount
+
+// ── Pending Order Block (BOS registered, waiting to be broken) ────────────────
+type OrderBlock
+    float top
+    float bot
+    int   barIdx
+    bool  bullBreaker   // true → bullish breaker when broken above; false → bearish
+
+// ── Active Breaker Block ──────────────────────────────────────────────────────
+type BreakerBlock
+    float top
+    float bot
+    int   leftBar
+    bool  isBull
+    box   zoneBox
+    label zoneLabel
+    bool  isDone
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  METHODS – SDZone
+// ═══════════════════════════════════════════════════════════════════════════════
+
+method sdMitigLevel(SDZone self, float pct) =>
+    h = self.top - self.bot
+    self.isSupply ? self.bot + h * (pct / 100.0) : self.top - h * (pct / 100.0)
+
+method sdIsMitigated(SDZone self, float pct) =>
+    lvl = self.sdMitigLevel(pct)
+    self.isSupply ? high > lvl : low < lvl
+
+method sdExtendRight(SDZone self) =>
+    box.set_right(self.zoneBox, bar_index + 1)
+
+method sdClose(SDZone self) =>
+    box.set_right(self.zoneBox, bar_index)
+    self.isDone := true
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  METHODS – DetectorState
+// ═══════════════════════════════════════════════════════════════════════════════
+
+method detReset(DetectorState self) =>
+    self.phase           := 0
+    self.baseHigh        := na
+    self.baseLow         := na
+    self.baseStartBar    := na
+    self.baseCandleCount := 0
+
+method detStartBase(DetectorState self, bool isBull) =>
+    self.phase           := 1
+    self.firstIsBull     := isBull
+    self.baseHigh        := na
+    self.baseLow         := na
+    self.baseStartBar    := na
+    self.baseCandleCount := 0
+
+method detAddBase(DetectorState self) =>
+    self.baseHigh        := na(self.baseHigh) ? high[1] : math.max(self.baseHigh, high[1])
+    self.baseLow         := na(self.baseLow)  ? low[1]  : math.min(self.baseLow,  low[1])
+    if na(self.baseStartBar)
+        self.baseStartBar := bar_index - 1
+    self.baseCandleCount := self.baseCandleCount + 1
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  METHODS – BreakerBlock
+// ═══════════════════════════════════════════════════════════════════════════════
+
+method bbMitigLevel(BreakerBlock self, float pct) =>
+    h = self.top - self.bot
+    self.isBull ? self.bot + h * (pct / 100.0) : self.top - h * (pct / 100.0)
+
+method bbIsMitigated(BreakerBlock self, float pct) =>
+    lvl = self.bbMitigLevel(pct)
+    self.isBull ? low < lvl : high > lvl
+
+method bbExtendRight(BreakerBlock self) =>
+    box.set_right(self.zoneBox, bar_index + 1)
+
+method bbClose(BreakerBlock self) =>
+    box.set_right(self.zoneBox, bar_index)
+    self.isDone := true
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  STATE VARIABLES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var sdZones      = array.new<SDZone>()
+var detect       = DetectorState.new(phase = 0, firstIsBull = false,
+                                      baseHigh = na, baseLow = na,
+                                      baseStartBar = na, baseCandleCount = 0)
+var pendingOBs   = array.new<OrderBlock>()
+var breakerZones = array.new<BreakerBlock>()
+
+var float lastSwingHigh    = na
+var int   lastSwingHighBar = na
+var float lastSwingLow     = na
+var int   lastSwingLowBar  = na
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  ATR + CANDLE CLASSIFICATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+atrValue = ta.atr(atrPeriod)
+
+isImpulseBull() => not na(atrValue) and math.abs(close[1] - open[1]) >= impulseAtrMult * atrValue and close[1] > open[1]
+isImpulseBear() => not na(atrValue) and math.abs(close[1] - open[1]) >= impulseAtrMult * atrValue and close[1] < open[1]
+isBase()        => not na(atrValue) and math.abs(close[1] - open[1]) <= baseAtrMult  * atrValue
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  HELPER: emit a new S&D zone drawing
+// ═══════════════════════════════════════════════════════════════════════════════
+
+emitSDZone(float top, float bot, int leftBar, bool isSupply, bool isReversal) =>
+    bgCol  = isSupply ? supplyColor  : demandColor
+    bdCol  = isSupply ? supplyBorder : demandBorder
+    txtCol = isSupply ? supplyBorder : demandBorder
+    lblTxt = switch
+        isSupply and isReversal       => "Supply (RBD)"
+        isSupply and not isReversal   => "Supply (DBD)"
+        not isSupply and isReversal   => "Demand (DBR)"
+        =>                               "Demand (RBR)"
+
+    zBox = box.new(left = leftBar, right = bar_index,
+                   top = top, bottom = bot,
+                   bgcolor = bgCol, border_color = bdCol, border_width = 1)
+    zLbl = sdShowLabels ? label.new(
+         x = leftBar, y = isSupply ? top : bot, text = lblTxt,
+         color = color.new(color.black, 100),
+         style = isSupply ? label.style_label_down : label.style_label_up,
+         textcolor = txtCol, size = size.small) : na
+
+    sdZones.push(SDZone.new(top = top, bot = bot, leftBar = leftBar,
+                             isSupply = isSupply, isReversal = isReversal,
+                             zoneBox = zBox, zoneLabel = zLbl, isDone = false))
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  HELPER: emit a new Breaker Block drawing
+// ═══════════════════════════════════════════════════════════════════════════════
+
+emitBreaker(float top, float bot, int leftBar, bool isBull) =>
+    bgCol  = isBull ? bullColor  : bearColor
+    bdCol  = isBull ? bullBorder : bearBorder
+    txtCol = isBull ? bullBorder : bearBorder
+    lblTxt = isBull ? "Bullish BB" : "Bearish BB"
+
+    zBox = box.new(left = leftBar, right = bar_index,
+                   top = top, bottom = bot,
+                   bgcolor = bgCol, border_color = bdCol, border_width = 1)
+    zLbl = bbShowLabels ? label.new(
+         x = leftBar, y = isBull ? bot : top, text = lblTxt,
+         color = color.new(color.black, 100),
+         style = isBull ? label.style_label_up : label.style_label_down,
+         textcolor = txtCol, size = size.small) : na
+
+    breakerZones.push(BreakerBlock.new(top = top, bot = bot, leftBar = leftBar,
+                                        isBull = isBull, zoneBox = zBox,
+                                        zoneLabel = zLbl, isDone = false))
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  HELPER: OB search functions
+// ═══════════════════════════════════════════════════════════════════════════════
+
+findLastBearish(int limit) =>
+    int res = -1
+    for i = 1 to limit
+        if close[i] < open[i]
+            res := i
+            break
+    res
+
+findLastBullish(int limit) =>
+    int res = -1
+    for i = 1 to limit
+        if close[i] > open[i]
+            res := i
+            break
+    res
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  SUPPLY & DEMAND DETECTION  (state machine)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if barstate.isconfirmed
+    prevBull = isImpulseBull()
+    prevBear = isImpulseBear()
+    prevBase = isBase()
+
+    if detect.phase == 0
+        if prevBull
+            detect.detStartBase(true)
+        else if prevBear
+            detect.detStartBase(false)
+
+    else if detect.phase == 1
+        if prevBase
+            detect.detAddBase()
+            if detect.baseCandleCount > maxBaseCandles
+                detect.detReset()
+        else if prevBull or prevBear
+            if detect.baseCandleCount >= 1
+                secIsBull  = prevBull
+                isRev      = detect.firstIsBull != secIsBull
+                isSupply   = switch
+                    detect.firstIsBull and not secIsBull   => true
+                    not detect.firstIsBull and not secIsBull => true
+                    => false
+                show = ((isRev and showReversal) or (not isRev and showContinuation))
+                     and ((isSupply and showSupply) or (not isSupply and showDemand))
+                if show and not na(detect.baseHigh) and not na(detect.baseLow)
+                    emitSDZone(detect.baseHigh, detect.baseLow,
+                                detect.baseStartBar, isSupply, isRev)
+            detect.detStartBase(prevBull)
+        else
+            detect.detReset()
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  PIVOT DETECTION  (Breaker Blocks)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+swingHigh = ta.pivothigh(high, pivotLen, pivotLen)
+swingLow  = ta.pivotlow (low,  pivotLen, pivotLen)
+
+if not na(swingHigh)
+    lastSwingHigh    := swingHigh
+    lastSwingHighBar := bar_index - pivotLen
+if not na(swingLow)
+    lastSwingLow    := swingLow
+    lastSwingLowBar := bar_index - pivotLen
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  BREAK OF STRUCTURE → ORDER BLOCK REGISTRATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bullBOS = not na(lastSwingHigh) and ta.crossover(close,  lastSwingHigh)
+bearBOS = not na(lastSwingLow)  and ta.crossunder(close, lastSwingLow)
+
+if bullBOS and showBearBB
+    obIdx = findLastBearish(math.min(lookbackBars, bar_index))
+    if obIdx > 0
+        pendingOBs.push(OrderBlock.new(
+             top = math.max(open[obIdx], close[obIdx]),
+             bot = math.min(open[obIdx], close[obIdx]),
+             barIdx = bar_index - obIdx, bullBreaker = false))
+
+if bearBOS and showBullBB
+    obIdx = findLastBullish(math.min(lookbackBars, bar_index))
+    if obIdx > 0
+        pendingOBs.push(OrderBlock.new(
+             top = math.max(open[obIdx], close[obIdx]),
+             bot = math.min(open[obIdx], close[obIdx]),
+             barIdx = bar_index - obIdx, bullBreaker = true))
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  OB → BREAKER BLOCK ACTIVATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if pendingOBs.size() > 0
+    for i = pendingOBs.size() - 1 to 0
+        ob = pendingOBs.get(i)
+        activated = switch
+            ob.bullBreaker      and close > ob.top => true
+            not ob.bullBreaker  and close < ob.bot => true
+            => false
+        if activated
+            emitBreaker(ob.top, ob.bot, ob.barIdx, ob.bullBreaker)
+            pendingOBs.remove(i)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  EXTEND & MITIGATE – S&D ZONES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if sdZones.size() > 0
+    for i = sdZones.size() - 1 to 0
+        z = sdZones.get(i)
+        if not z.isDone
+            if z.sdIsMitigated(sdMitigationPct)
+                z.sdClose()
+            else if sdExtend
+                z.sdExtendRight()
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  EXTEND & MITIGATE – BREAKER BLOCKS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if breakerZones.size() > 0
+    for i = breakerZones.size() - 1 to 0
+        bb = breakerZones.get(i)
+        if not bb.isDone
+            if bb.bbIsMitigated(bbMitigationPct)
+                bb.bbClose()
+            else if bbExtend
+                bb.bbExtendRight()
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ██  PIVOT MARKERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+plotshape(showPivots and not na(swingHigh),
+     title    = "Swing High",
+     style    = shape.triangledown,
+     location = location.abovebar,
+     color    = color.new(color.orange, 0),
+     size     = size.tiny,
+     offset   = -pivotLen)
+
+plotshape(showPivots and not na(swingLow),
+     title    = "Swing Low",
+     style    = shape.triangleup,
+     location = location.belowbar,
+     color    = color.new(color.lime, 0),
+     size     = size.tiny,
+     offset   = -pivotLen)
