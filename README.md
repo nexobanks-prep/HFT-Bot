@@ -23,13 +23,15 @@ A high-frequency scalping bot for **XAUUSD** (gold) and indices (**NAS100** / **
 ```
 Bookmark/
 ├── config/
-│   └── settings.py          # All tunable parameters (instruments, risk, strategy)
+│   └── settings.py               # All tunable parameters (instruments, risk, strategy)
+├── pinescripts/
+│   └── breaker_blocks.pine       # TradingView Pine Script v5 – Breaker Blocks indicator
 ├── src/
-│   ├── indicators.py        # EMA, SMA, RSI, ATR, Bollinger Bands, VWAP
-│   ├── strategy.py          # HFT scalping signal engine
-│   ├── risk_manager.py      # Drawdown guard, position sizing, trailing stops
-│   ├── broker.py            # MT5 adapter + back-test simulator
-│   └── bot.py               # Main event loop (entry point)
+│   ├── indicators.py             # EMA, SMA, RSI, ATR, Bollinger Bands, VWAP
+│   ├── strategy.py               # HFT scalping signal engine
+│   ├── risk_manager.py           # Drawdown guard, position sizing, trailing stops
+│   ├── broker.py                 # MT5 adapter + back-test simulator
+│   └── bot.py                    # Main event loop (entry point)
 ├── tests/
 │   ├── test_indicators.py
 │   ├── test_risk_manager.py
@@ -108,3 +110,45 @@ The bot uses a **multi-condition scoring system** (0–1).  A trade fires only w
 This software is provided for educational and research purposes only.
 Trading financial instruments carries significant risk and you can lose more than your initial investment.
 **Always test in a demo environment before going live.**  Past performance is not indicative of future results.
+
+---
+
+## Pine Script – Breaker Blocks indicator
+
+`pinescripts/breaker_blocks.pine` is a fully open-source **TradingView Pine Script v5**
+indicator that detects and draws **Breaker Blocks** using Smart Money Concepts (SMC).
+
+### What is a Breaker Block?
+
+A Breaker Block is a *failed* Order Block:
+
+| Concept | Description |
+|---|---|
+| **Order Block (OB)** | The last opposing candle before a strong impulsive move that breaks a prior swing high/low |
+| **Bullish Breaker** | A bearish OB that was "broken" upward (bullish BOS), then price revisits and closes back above the zone – former resistance turns into support |
+| **Bearish Breaker** | A bullish OB that was "broken" downward (bearish BOS), then price revisits and closes back below the zone – former support turns into resistance |
+
+### Detection logic
+
+1. Swing highs / lows are identified with a configurable **Pivot Length** (default 10 bars).
+2. A **Break of Structure (BOS)** is detected when the closing price crosses above a swing high (bullish BOS) or below a swing low (bearish BOS).
+3. On each BOS the last opposing candle within a look-back window is stored as a pending **Order Block zone**.
+4. When price closes back *through* the OB zone in the opposite direction the zone flips to a **Breaker Block** and a filled rectangle is drawn.
+5. Boxes extend to the right until price **mitigates** (penetrates a configurable % of the zone height), at which point the box is closed.
+
+### How to add the indicator in TradingView
+
+1. Open TradingView and go to **Pine Editor** (`/` → *Open Pine Editor*).
+2. Paste the contents of `pinescripts/breaker_blocks.pine`.
+3. Click **Add to chart**.
+4. Adjust the inputs in the *Settings* panel:
+
+| Input | Default | Description |
+|---|---|---|
+| Pivot Length | 10 | Bars on each side to confirm a swing high/low |
+| Order-Block Look-back | 5 | How many bars back to search for the OB candle |
+| Mitigation Level (%) | 50 | Zone is invalidated when price penetrates this % of its height |
+| Show Bullish / Bearish Breakers | true | Toggle each type |
+| Extend Boxes to the Right | true | Keep extending until mitigated |
+| Show Labels | true | Display zone labels on the chart |
+| Colors | teal / red | Fully customisable fill and border colours |

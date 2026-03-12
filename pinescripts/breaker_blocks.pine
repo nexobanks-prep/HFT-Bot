@@ -1,0 +1,355 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+//
+// © nexobanks-prep / HFT-Bot – open-source, free to use and modify.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+//  BREAKER BLOCKS  (Smart Money Concepts)
+//  TradingView Pine Script v5
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//  What is a Breaker Block?
+//  ─────────────────────────
+//  A Breaker Block is a *failed* Order Block.
+//
+//  • Order Block (OB): the last opposing candle before a strong impulsive move
+//    that also takes out a prior swing high/low (a "Break of Structure").
+//
+//  • When price later returns and breaks *through* that Order Block zone,
+//    the zone "flips":
+//      – A bullish OB that gets broken to the downside → Bearish Breaker Block
+//        (former support now acts as resistance)
+//      – A bearish OB that gets broken to the upside  → Bullish Breaker Block
+//        (former resistance now acts as support)
+//
+//  Detection logic (this script)
+//  ─────────────────────────────
+//  1.  Find swing highs / swing lows using a configurable pivot length.
+//  2.  Detect Break-of-Structure (BOS):
+//        • Bullish BOS  – close > prior swing high  → look back for last
+//          bearish (down-close) candle before the BOS candle as the OB zone.
+//        • Bearish BOS  – close < prior swing low   → look back for last
+//          bullish (up-close) candle before the BOS candle as the OB zone.
+//  3.  Mark each OB zone.  When price later closes *through* the OB zone
+//      in the opposite direction it becomes a Breaker Block.
+//  4.  Draw filled boxes for active Breaker Blocks; extend them until price
+//      revisits (mitigates) the zone.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+//  BOS direction → Order Block type → Breaker Block type (quick reference)
+//  ─────────────────────────────────────────────────────────────────────────
+//  Bullish BOS (close crosses above swing high):
+//    → last BEARISH candle before BOS = bearish Order Block
+//    → when price later closes BELOW the OB bottom → BEARISH Breaker Block
+//    → guarded by the "Show Bearish Breaker Blocks" toggle
+//
+//  Bearish BOS (close crosses below swing low):
+//    → last BULLISH candle before BOS = bullish Order Block
+//    → when price later closes ABOVE the OB top  → BULLISH Breaker Block
+//    → guarded by the "Show Bullish Breaker Blocks" toggle
+// ─────────────────────────────────────────────────────────────────────────────
+
+//@version=5
+indicator(
+     title       = "Breaker Blocks [HFT-Bot]",
+     shorttitle  = "BreakerBlocks",
+     overlay     = true,
+     max_boxes_count  = 500,
+     max_lines_count  = 200,
+     max_labels_count = 200
+ )
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var string GRP_DETECTION = "Detection"
+pivotLen = input.int(
+     defval  = 10,
+     title   = "Pivot Length",
+     minval  = 2,
+     maxval  = 50,
+     group   = GRP_DETECTION,
+     tooltip = "Number of bars on each side used to confirm a swing high/low."
+ )
+
+lookbackBars = input.int(
+     defval  = 5,
+     title   = "Order-Block Look-back (bars)",
+     minval  = 1,
+     maxval  = 20,
+     group   = GRP_DETECTION,
+     tooltip = "How many bars back to search for the last opposing candle that forms the Order Block."
+ )
+
+mitigationPct = input.float(
+     defval  = 50.0,
+     title   = "Mitigation Level (%)",
+     minval  = 0.0,
+     maxval  = 100.0,
+     step    = 5.0,
+     group   = GRP_DETECTION,
+     tooltip = "A Breaker Block is considered mitigated (invalidated) when price penetrates this % of its height."
+ )
+
+var string GRP_DISPLAY = "Display"
+showBullBreaker = input.bool(
+     defval = true,
+     title  = "Show Bullish Breaker Blocks",
+     group  = GRP_DISPLAY
+ )
+showBearBreaker = input.bool(
+     defval = true,
+     title  = "Show Bearish Breaker Blocks",
+     group  = GRP_DISPLAY
+ )
+extendBoxes = input.bool(
+     defval  = true,
+     title   = "Extend Boxes to the Right",
+     group   = GRP_DISPLAY,
+     tooltip = "Keep extending the box until the zone is mitigated."
+ )
+showLabels = input.bool(
+     defval = true,
+     title  = "Show Labels",
+     group  = GRP_DISPLAY
+ )
+
+bullColor   = input.color(defval = color.new(color.teal,  70), title = "Bullish Breaker Color", group = GRP_DISPLAY)
+bearColor   = input.color(defval = color.new(color.red,   70), title = "Bearish Breaker Color", group = GRP_DISPLAY)
+bullBorder  = input.color(defval = color.teal,                 title = "Bullish Border Color",  group = GRP_DISPLAY)
+bearBorder  = input.color(defval = color.red,                  title = "Bearish Border Color",  group = GRP_DISPLAY)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTERNAL STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Each Breaker Block is tracked in parallel arrays so we can update (extend or
+// delete) boxes on subsequent bars without needing a custom object type.
+//
+//  _bbTop    – top price of the zone
+//  _bbBot    – bottom price of the zone
+//  _bbLeft   – bar_index of the left edge
+//  _bbIsBull – true = bullish breaker, false = bearish breaker
+//  _bbBox    – the box drawing object
+//  _bbLabel  – the label drawing object (may be na if labels off)
+//  _bbDone   – true = mitigated / closed
+
+var float[]  _bbTop    = array.new_float()
+var float[]  _bbBot    = array.new_float()
+var int[]    _bbLeft   = array.new_int()
+var bool[]   _bbIsBull = array.new_bool()
+var box[]    _bbBox    = array.new_box()
+var label[]  _bbLabel  = array.new_label()
+var bool[]   _bbDone   = array.new_bool()
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Scans backward from bar [startBar] to bar [endBar] (both are lookback offsets,
+// where offset 1 = the bar immediately before the current bar).
+// Returns the offset of the most-recent bearish candle found (smallest i),
+// i.e. the chronologically *last* bearish candle before the current bar.
+// Returns -1 if no bearish candle exists in the range.
+findLastBearishCandle(int startBar, int endBar) =>
+    int result = -1
+    for i = startBar to endBar
+        if close[i] < open[i]
+            result := i
+            break   // stop at the most-recent match (smallest lookback offset)
+    result
+
+// Same as above but for the most-recent bullish candle.
+findLastBullishCandle(int startBar, int endBar) =>
+    int result = -1
+    for i = startBar to endBar
+        if close[i] > open[i]
+            result := i
+            break
+    result
+
+// Add a new Breaker Block zone.
+addBreaker(float topPrice, float botPrice, int leftBar, bool isBull) =>
+    bgCol  = isBull ? bullColor  : bearColor
+    bdCol  = isBull ? bullBorder : bearBorder
+    lbl    = isBull ? "Bullish BB" : "Bearish BB"
+    txtCol = isBull ? bullBorder  : bearBorder
+
+    newBox = box.new(
+         left         = leftBar,
+         right        = bar_index,
+         top          = topPrice,
+         bottom       = botPrice,
+         bgcolor      = bgCol,
+         border_color = bdCol,
+         border_width = 1
+     )
+
+    newLabel = showLabels ? label.new(
+         x      = leftBar,
+         y      = isBull ? botPrice : topPrice,
+         text   = lbl,
+         color  = color.new(color.black, 100),
+         style  = isBull ? label.style_label_up : label.style_label_down,
+         textcolor = txtCol,
+         size   = size.small
+     ) : na
+
+    array.push(_bbTop,    topPrice)
+    array.push(_bbBot,    botPrice)
+    array.push(_bbLeft,   leftBar)
+    array.push(_bbIsBull, isBull)
+    array.push(_bbBox,    newBox)
+    array.push(_bbLabel,  newLabel)
+    array.push(_bbDone,   false)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PIVOT DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ta.pivothigh / ta.pivotlow return a value on the bar that *confirms* the pivot
+// (i.e., pivotLen bars after the actual pivot bar).  The returned value is the
+// price of the pivot; na if the bar is not a confirmed pivot.
+
+swingHigh = ta.pivothigh(high, pivotLen, pivotLen)
+swingLow  = ta.pivotlow (low,  pivotLen, pivotLen)
+
+// Track the most-recent confirmed swing high / low prices and their bar indices.
+var float lastSwingHigh     = na
+var int   lastSwingHighBar  = na
+var float lastSwingLow      = na
+var int   lastSwingLowBar   = na
+
+if not na(swingHigh)
+    lastSwingHigh    := swingHigh
+    lastSwingHighBar := bar_index - pivotLen   // actual pivot bar
+
+if not na(swingLow)
+    lastSwingLow    := swingLow
+    lastSwingLowBar := bar_index - pivotLen
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BREAK OF STRUCTURE → ORDER BLOCK → BREAKER BLOCK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Bullish BOS: current close breaks above the last confirmed swing high ──
+bullBOS = not na(lastSwingHigh) and ta.crossover(close, lastSwingHigh)
+// ── Bearish BOS: current close breaks below the last confirmed swing low ──
+bearBOS = not na(lastSwingLow)  and ta.crossunder(close, lastSwingLow)
+
+// When a bullish BOS fires we look back for the last *bearish* candle
+// (the OB) within lookbackBars.  That zone is the potential Breaker Block if
+// price later comes back and breaks through it downward.
+// But per the definition the Breaker Block is only *activated* once price has
+// already broken back through the OB in the opposite direction.
+//
+// Simplified approach used here (widely adopted in community scripts):
+//   • At the moment of BOS we record the OB zone.
+//   • On every subsequent bar we check whether price has closed *back through*
+//     the OB zone (in the direction that would "break" it).
+//   • Once broken, the OB flips to a Breaker Block and we draw it.
+
+// Storage for pending (unbroken) order blocks.
+// _obBullBreaker = true means this OB will become a BULLISH breaker once re-entered.
+var float[]  _obTop         = array.new_float()
+var float[]  _obBot         = array.new_float()
+var int[]    _obBar         = array.new_int()
+var bool[]   _obBullBreaker = array.new_bool()   // true → bullish breaker; false → bearish breaker
+var bool[]   _obDone        = array.new_bool()
+
+// ── Register new Order Blocks on Break-of-Structure ──────────────────────────
+if bullBOS and showBearBreaker
+    // Bullish BOS → last bearish candle = bearish OB → will become a BEARISH breaker
+    obIdx = findLastBearishCandle(1, math.min(lookbackBars, bar_index))
+    if obIdx >= 0
+        obTop = math.max(open[obIdx], close[obIdx])
+        obBot = math.min(open[obIdx], close[obIdx])
+        array.push(_obTop,         obTop)
+        array.push(_obBot,         obBot)
+        array.push(_obBar,         bar_index - obIdx)
+        array.push(_obBullBreaker, false)   // bearish OB → bearish breaker when broken below
+        array.push(_obDone,        false)
+
+if bearBOS and showBullBreaker
+    // Bearish BOS → last bullish candle = bullish OB → will become a BULLISH breaker
+    obIdx = findLastBullishCandle(1, math.min(lookbackBars, bar_index))
+    if obIdx >= 0
+        obTop = math.max(open[obIdx], close[obIdx])
+        obBot = math.min(open[obIdx], close[obIdx])
+        array.push(_obTop,         obTop)
+        array.push(_obBot,         obBot)
+        array.push(_obBar,         bar_index - obIdx)
+        array.push(_obBullBreaker, true)    // bullish OB → bullish breaker when broken above
+        array.push(_obDone,        false)
+
+// ── Check whether any pending OB has been broken (→ becomes Breaker Block) ───
+if array.size(_obTop) > 0
+    for i = array.size(_obTop) - 1 to 0
+        if not array.get(_obDone, i)
+            obTop        = array.get(_obTop,         i)
+            obBot        = array.get(_obBot,         i)
+            obBar        = array.get(_obBar,         i)
+            obBullBreaker = array.get(_obBullBreaker, i)
+
+            // Bullish OB: price closes above the OB top → activates as BULLISH breaker
+            bullBroken = obBullBreaker  and close > obTop
+            // Bearish OB: price closes below the OB bottom → activates as BEARISH breaker
+            bearBroken = not obBullBreaker and close < obBot
+
+            if bullBroken or bearBroken
+                addBreaker(obTop, obBot, obBar, obBullBreaker)
+                array.set(_obDone, i, true)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXTEND ACTIVE BREAKER BLOCKS & CHECK MITIGATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if array.size(_bbTop) > 0
+    for i = array.size(_bbTop) - 1 to 0
+        if not array.get(_bbDone, i)
+            bbTop   = array.get(_bbTop,    i)
+            bbBot   = array.get(_bbBot,    i)
+            isBull  = array.get(_bbIsBull, i)
+            bbBoxObj = array.get(_bbBox,   i)
+
+            // Mitigation price
+            zoneHeight   = bbTop - bbBot
+            mitigLevel   = isBull
+                 ? bbBot + zoneHeight * (mitigationPct / 100.0)   // bull: measured from bottom
+                 : bbTop - zoneHeight * (mitigationPct / 100.0)   // bear: measured from top
+
+            mitigated = isBull
+                 ? low  <= mitigLevel   // price dips into bullish breaker zone
+                 : high >= mitigLevel   // price pops into bearish breaker zone
+
+            if mitigated
+                // Close the box at the current bar and mark done
+                box.set_right(bbBoxObj, bar_index)
+                array.set(_bbDone, i, true)
+            else if extendBoxes
+                box.set_right(bbBoxObj, bar_index + 1)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEBUG / PIVOT MARKERS  (optional visual confirmation)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+plotshape(
+     series    = not na(swingHigh),
+     title     = "Swing High",
+     style     = shape.triangledown,
+     location  = location.abovebar,
+     color     = color.new(color.orange, 0),
+     size      = size.tiny,
+     offset    = -pivotLen
+ )
+
+plotshape(
+     series    = not na(swingLow),
+     title     = "Swing Low",
+     style     = shape.triangleup,
+     location  = location.belowbar,
+     color     = color.new(color.lime, 0),
+     size      = size.tiny,
+     offset    = -pivotLen
+ )
